@@ -1,0 +1,42 @@
+name: Update snapshot index
+
+on:
+  schedule:
+    # Midday UTC, so the previous UTC day is always complete by the time it is recorded.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-index
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1"
+
+      # Reads the committed index, fetches only the history needed to cover the days
+      # missing from it, and appends them. A run with nothing to add makes no network
+      # requests at all.
+      - name: Extend index
+        run: julia tools/generate_index.jl
+
+      - name: Commit any new snapshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.toml
+          if git diff --staged --quiet; then
+            echo "no new snapshots"
+          else
+            git commit -m "Record snapshots through $(date -u +%F)"
+            git push
+          fi
