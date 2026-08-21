@@ -1,6 +1,8 @@
 # RegistrySnapshots.jl
 
-Resolve Julia packages against the General registry as it existed on an earlier day. Requires a patches [Pkg.jl version](https://github.com/BjarkeHautop/Pkg.jl/tree/explicit-registries) and Julia nightly to function. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
+Resolve Julia packages against the General registry as it existed on an earlier day. Requires a patched [Pkg.jl version](https://github.com/BjarkeHautop/Pkg.jl/tree/explicit-registries) and Julia nightly to function. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
+
+Why the patch: stock Pkg always resolves against whatever registry is installed in your depot, there's no per-call override. Without the patch, resolving against a snapshot would mean overwriting your live registry and restoring it after — affecting every other project using that depot in the meantime, and leaving it broken if the process dies mid-swap. The patch just adds a `registries` keyword so a snapshot can be passed in for one call, depot untouched.
 
 To use it simply just use RegistrySnapshots whenever you would use Pkg:
 
