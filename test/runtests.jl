@@ -1,6 +1,9 @@
 using RegistrySnapshots
 using Dates
 using Test
+using Tar
+using TOML
+using CodecZlib: GzipCompressorStream, GzipDecompressorStream
 
 const RS = RegistrySnapshots
 
@@ -93,6 +96,102 @@ withindex(f) = (RS.INDEX[] = FAKE_INDEX; try f() finally RS.INDEX[] = nothing en
         end
         withenv("JULIA_REGISTRY_SNAPSHOT_INDEX" => nothing) do
             @test RS.index_url() == RS.DEFAULT_INDEX_URL
+        end
+    end
+
+    @testset "yank patching" begin
+        # Builds a `General-<commit>/` tree shaped like a GitHub codeload tarball: one package
+        # (`DataFrames`) whose 1.1.0 is yanked only in the "live" copy, plus an unrelated
+        # package that must survive completely untouched.
+        function build_registry(root::String, commit::String; yanked_112::Bool)
+            top = joinpath(root, "General-$commit")
+            mkpath(joinpath(top, "D", "DataFrames"))
+            write(joinpath(top, "Registry.toml"), "name = \"General\"\n")
+
+            versions = Dict{String, Any}(
+                "1.0.0" => Dict{String, Any}("git-tree-sha1" => "b"^40),
+                "1.1.0" => Dict{String, Any}("git-tree-sha1" => "c"^40),
+            )
+            yanked_112 && (versions["1.1.0"]["yanked"] = true)
+            open(io -> TOML.print(io, versions), joinpath(top, "D", "DataFrames", "Versions.toml"), "w")
+
+            mkpath(joinpath(top, "E", "Example"))
+            write(
+                joinpath(top, "E", "Example", "Versions.toml"),
+                sprint(TOML.print, Dict{String, Any}("0.1.0" => Dict{String, Any}("git-tree-sha1" => "d"^40))),
+            )
+            return top
+        end
+
+        tar_gz(root::String, dest::String) = open(GzipCompressorStream, dest, "w") do io
+            Tar.create(root, io)
+        end
+
+        # Reads a single `Versions.toml` back out of a compressed snapshot archive, the same
+        # way Pkg would, without extracting anything else.
+        function read_versions(archive::String, relpath::String)
+            open(archive) do io
+                tar = GzipDecompressorStream(io)
+                found = Ref{Union{Nothing, Dict{String, Any}}}(nothing)
+                Tar.read_tarball(Tar.true_predicate, tar) do hdr, parts
+                    if join(parts, "/") == relpath
+                        found[] = TOML.parse(String(Tar.read_data(tar; size = hdr.size)))
+                    else
+                        Tar.skip_data(tar, hdr.size)
+                    end
+                end
+                return found[]
+            end
+        end
+
+        mktempdir() do work
+            commit = "a"^40
+            srcdir = joinpath(work, "src")
+            mkpath(srcdir)
+
+            # The historical snapshot: 1.1.0 not yanked yet, named exactly `<commit>` so
+            # `materialize` finds it at `"$tarball_url/$commit"`.
+            old_root = joinpath(work, "old")
+            old_top = build_registry(old_root, commit; yanked_112 = false)
+            tar_gz(old_root, joinpath(srcdir, commit))
+
+            # The tree hash the index would have recorded: the registry root's own hash,
+            # without the wrapping `General-<commit>/` directory `materialize` strips off.
+            stripped = joinpath(work, "stripped.tar.gz")
+            tar_gz(old_top, stripped)
+            expected_tree = open(io -> Tar.tree_hash(GzipDecompressorStream(io)), stripped)
+
+            # The live registry at `LIVE_REF`: 1.1.0 has since been yanked.
+            live_root = joinpath(work, "live")
+            build_registry(live_root, commit; yanked_112 = true)
+            tar_gz(live_root, joinpath(srcdir, RS.LIVE_REF))
+
+            tarball_url = "file://$srcdir"
+
+            dest = joinpath(work, "patched")
+            RS.materialize(commit, expected_tree, tarball_url, dest; check_yanked = true)
+            toml = TOML.parsefile(joinpath(dest, "General.toml"))
+            archive = joinpath(dest, toml["path"]::String)
+
+            df = read_versions(archive, "D/DataFrames/Versions.toml")
+            @test df["1.1.0"]["yanked"] == true
+            @test !haskey(df["1.0.0"], "yanked")
+
+            # An unrelated file must come through byte-for-byte, not just "unyanked".
+            example = read_versions(archive, "E/Example/Versions.toml")
+            @test !haskey(example["0.1.0"], "yanked")
+            @test example["0.1.0"]["git-tree-sha1"] == "d"^40
+
+            # The recorded tree hash must reflect what was actually patched onto disk, not the
+            # original (now stale) hash from the index.
+            @test toml["git-tree-sha1"] != expected_tree
+
+            # `check_yanked = false` must skip the live fetch entirely and leave the archive,
+            # and its recorded tree hash, exactly as fetched.
+            dest_unchecked = joinpath(work, "unchecked")
+            RS.materialize(commit, expected_tree, tarball_url, dest_unchecked; check_yanked = false)
+            toml_unchecked = TOML.parsefile(joinpath(dest_unchecked, "General.toml"))
+            @test toml_unchecked["git-tree-sha1"] == expected_tree
         end
     end
 end
