@@ -44,22 +44,29 @@ Nothing to your live registry. The snapshot is kept in its own directory, `<depo
 |---|---|
 | index fetch | 30 KB, once per session |
 | new snapshot | 11 MB download — same as a live registry update |
+| yank check | another 11 MB download, once per new snapshot (see below) |
 | repeated use of a cached day | instant, read straight from the compressed snapshot |
 | disk | ~11 MB per cached snapshot (compressed, same format as a live registry) |
 
 Only the `keep` most recent snapshots are retained per depot (default 1), so a rolling `cutoff = "7 days"` does not accumulate one per day.
+
+### Yanks
+
+A frozen snapshot has an obvious problem: if a version gets yanked *after* the cutoff day, the snapshot has no way to know, and would happily keep resolving to it forever. To fix that, the first time a commit is fetched, `registries`/the wrappers also download the live registry to a temp file, scan it for `yanked = true` entries, and overlay those onto the snapshot — after the snapshot's own tree hash has already been checked against the index. Pass `check_yanked = false` to skip this and save the extra download.
+
+This check only runs once, when a commit is first materialized. A version yanked *after* that point is still missed until the cached snapshot is deleted (`gc`) and re-fetched — snapshots are otherwise never touched again once cached.
 
 ## API
 
 | function | what it does |
 |---|---|
 | `add`, `develop`, `rm`, `update`, `pin`, `free`, `instantiate`, `resolve`, `status`, `why` | as the matching `Pkg.*` function, but resolved against the General registry as of `cutoff` |
-| `RegistrySnapshots.registry(cutoff; depot, keep)` | the snapshot for `cutoff` as a `Pkg.Registry.RegistryInstance` — pass it yourself as `registries = [...]` to any other Pkg call |
+| `RegistrySnapshots.registry(cutoff; depot, keep, check_yanked)` | the snapshot for `cutoff` as a `Pkg.Registry.RegistryInstance` — pass it yourself as `registries = [...]` to any other Pkg call |
 | `RegistrySnapshots.cached(; depot)` | commits currently cached in `depot` |
 | `RegistrySnapshots.gc(; depot, keep = 0)` | delete cached snapshots, keeping the `keep` most recently used |
 | `RegistrySnapshots.coverage()` | the range of days the index can resolve to |
 
-Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`) and `keep` (default `1`, how many snapshots to retain in that depot). Everything else is forwarded straight to the underlying `Pkg` function.
+Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`), `keep` (default `1`, how many snapshots to retain in that depot), and `check_yanked` (default `true`, see [Yanks](#yanks)). Everything else is forwarded straight to the underlying `Pkg` function.
 
 `cutoff` accepts a `Date`, a relative age (`"7 days"`, `"2 weeks"`), or a date string (`"2026-01-01"`).
 

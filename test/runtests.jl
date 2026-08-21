@@ -34,20 +34,20 @@ withindex(f) = (RS.INDEX[] = FAKE_INDEX; try f() finally RS.INDEX[] = nothing en
         @test_throws ErrorException RS.parse_cutoff("2026-13-01")
     end
 
-    @testset "resolve" begin
+    @testset "resolve_date" begin
         withindex() do
             # An exact hit resolves to itself.
-            @test RS.resolve(Date(2026, 1, 2))[1] == Date(2026, 1, 2)
-            @test RS.resolve(Date(2026, 1, 2))[2] == "c"^40
+            @test RS.resolve_date(Date(2026, 1, 2))[1] == Date(2026, 1, 2)
+            @test RS.resolve_date(Date(2026, 1, 2))[2] == "c"^40
 
             # A day with no entry falls back to the newest earlier one, rather than failing.
-            @test RS.resolve(Date(2026, 1, 4))[1] == Date(2026, 1, 2)
+            @test RS.resolve_date(Date(2026, 1, 4))[1] == Date(2026, 1, 2)
 
             # A cutoff past the end of the index clamps to the newest snapshot.
-            @test RS.resolve(Date(2030, 1, 1))[1] == Date(2026, 1, 5)
+            @test RS.resolve_date(Date(2030, 1, 1))[1] == Date(2026, 1, 5)
 
             # A cutoff before coverage begins is an error, not a silent nearest match.
-            @test_throws ErrorException RS.resolve(Date(2025, 1, 1))
+            @test_throws ErrorException RS.resolve_date(Date(2025, 1, 1))
         end
     end
 
@@ -59,7 +59,8 @@ withindex(f) = (RS.INDEX[] = FAKE_INDEX; try f() finally RS.INDEX[] = nothing en
 
     @testset "status without a pin" begin
         mktempdir() do depot
-            @test RS.status(depot = depot) === nothing
+            # `cutoff` is required on every wrapper, `status` included.
+            @test_throws UndefKeywordError RS.status(depot = depot)
         end
     end
 
@@ -76,7 +77,7 @@ withindex(f) = (RS.INDEX[] = FAKE_INDEX; try f() finally RS.INDEX[] = nothing en
                 first_date, last_date = RS.coverage()
                 @test first_date <= last_date
                 # Every recorded day must resolve to a full-length commit hash.
-                date, commit, tree = RS.resolve(last_date)
+                date, commit, tree = RS.resolve_date(last_date)
                 @test date == last_date
                 @test length(commit) == 40
                 @test length(tree) == 40

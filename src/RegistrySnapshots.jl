@@ -30,6 +30,12 @@ const DEFAULT_INDEX_URL = "https://raw.githubusercontent.com/BjarkeHautop/Regist
 
 const REGISTRY_UUID = "23338594-aafe-5451-b93e-139f81909106"
 
+# General's default branch, fetched once per newly materialized snapshot to check for yanks
+# that happened after the snapshot's own commit -- a `yanked = true` is written to
+# `Versions.toml` only after the fact, so an old commit can never know about a yank that
+# happened later, only the live registry can.
+const LIVE_REF = "master"
+
 """
 URL of the date-to-commit index. May also be a local path. Override it to use a privately
 hosted index, or to work entirely offline.
@@ -232,10 +238,95 @@ function strip_top_level_prefix(old_tar::IO, new_tar::IO, commit::AbstractString
     return new_tar
 end
 
+# Scans the live registry tarball for every `Versions.toml` that currently has at least one
+# `yanked = true` entry. Costs one full registry
+# download (same size as a snapshot fetch), so it is only worth paying once per newly
+# materialized snapshot, never per resolve.
+function fetch_yanked_versions(tarball_url::AbstractString, ref::AbstractString)
+    yanked = Dict{String, Set{String}}()
+    raw = tempname()
+    try
+        shown = Ref(0.0)
+        Downloads.download(
+            "$tarball_url/$ref", raw;
+            progress = (total, now) -> report_progress("Checking for yanks", total, now, shown),
+        )
+        open(raw) do io
+            tar = GzipDecompressorStream(io)
+            Tar.read_tarball(Tar.true_predicate, tar) do hdr, parts
+                parts = parts[2:end] # drop the leading `General-<ref>` component
+                if length(parts) == 3 && parts[3] == "Versions.toml"
+                    versions = TOML.parse(String(Tar.read_data(tar; size = hdr.size)))
+                    entries = Set{String}(v for (v, meta) in versions if get(meta, "yanked", false) == true)
+                    isempty(entries) || (yanked[join(parts, "/")] = entries)
+                else
+                    Tar.skip_data(tar, hdr.size)
+                end
+            end
+        end
+    finally
+        Base.rm(raw; force = true)
+    end
+    return yanked
+end
+
+# Overlays `yanked = true` onto the `Versions.toml` entries named in `yanked` (paths relative
+# to the registry root, as produced by `fetch_yanked_versions`), leaving every other file
+# byte-for-byte untouched. Run only after `old_tar`'s content has already been verified
+# against the index's recorded tree hash -- this deliberately changes bytes, so it must never
+# be the thing that hash is checked against.
+function apply_yanked_patch(old_tar::IO, new_tar::IO, yanked::Dict{String, Set{String}})
+    old_tar = Tar.check_rewrite_old_tarball(old_tar)
+    tree = Dict{String, Any}()
+    Tar.read_tarball(Tar.true_predicate, old_tar) do hdr, parts
+        node = tree
+        name = pop!(parts)
+        relpath = isempty(parts) ? name : join(vcat(parts, [name]), "/")
+        for part in parts
+            node′ = get(node, part, nothing)
+            if !(node′ isa Dict)
+                node′ = node[part] = Dict{String, Any}()
+            end
+            node = node′
+        end
+        if hdr.type == :directory
+            get(node, name, nothing) isa Dict || (node[name] = Dict{String, Any}())
+            Tar.skip_data(old_tar, hdr.size)
+        elseif haskey(yanked, relpath)
+            versions = TOML.parse(String(Tar.read_data(old_tar; size = hdr.size)))
+            for v in yanked[relpath]
+                haskey(versions, v) && (versions[v]["yanked"] = true)
+            end
+            node[name] = Vector{UInt8}(sprint(TOML.print, versions))
+        else
+            node[name] = (hdr, position(old_tar))
+            Tar.skip_data(old_tar, hdr.size)
+        end
+    end
+    Tar.write_tarball(new_tar, tree) do node, tar_path
+        if node isa Dict
+            Tar.Header(tar_path, :directory, 0o755, 0, ""), node
+        elseif node isa Vector{UInt8}
+            Tar.Header(tar_path, :file, 0o644, length(node), ""), IOBuffer(node)
+        else
+            hdr, pos = node
+            Tar.Header(hdr; path = tar_path), (old_tar, pos)
+        end
+    end
+    return new_tar
+end
+
 """
 Fetch the registry at `commit` and store it in Pkg's compressed registry format.
+
+Unless `check_yanked` is `false`, also overlays `yanked = true` for any version the live
+registry has yanked since `commit` -- otherwise a version yanked the day after the snapshot
+was taken would be served forever, since a frozen historical commit can never learn about it.
 """
-function materialize(commit::AbstractString, tree::AbstractString, tarball_url::AbstractString, dest::AbstractString)
+function materialize(
+        commit::AbstractString, tree::AbstractString, tarball_url::AbstractString,
+        dest::AbstractString; check_yanked::Bool = true
+    )
     mkpath(dirname(dest))
     staging = dest * ".tmp"
     ispath(staging) && Base.rm(staging; recursive = true, force = true)
@@ -259,17 +350,39 @@ function materialize(commit::AbstractString, tree::AbstractString, tarball_url::
         end
 
         # The index records the commit's root tree, and the registry root is the repo root,
-        # so a snapshot hashing to anything else was not built from what was promised.
+        # so a snapshot hashing to anything else was not built from what was promised. This
+        # must run before any yank patch is applied below -- it verifies content against a
+        # hash computed from the original, unmodified registry.
         got = open(archive) do io
             Tar.tree_hash(GzipDecompressorStream(io))
         end
         got == tree || error("snapshot $commit hashed to $got, but the index records $tree")
 
+        # `final_tree` is what actually ends up on disk: `tree` itself, unless a yank patch
+        # below changed bytes, in which case Pkg's own cache key must reflect that rather than
+        # keep pointing at content that no longer matches.
+        final_tree = tree
+        if check_yanked
+            yanked = fetch_yanked_versions(tarball_url, LIVE_REF)
+            if !isempty(yanked)
+                patched = archive * ".patched"
+                open(archive) do io
+                    open(GzipCompressorStream, patched, "w") do gz_out
+                        apply_yanked_patch(GzipDecompressorStream(io), gz_out, yanked)
+                    end
+                end
+                mv(patched, archive; force = true)
+                final_tree = open(archive) do io
+                    Tar.tree_hash(GzipDecompressorStream(io))
+                end
+            end
+        end
+
         open(joinpath(staging, "General.toml"), "w") do io
             TOML.print(
                 io, Dict(
                     "uuid" => REGISTRY_UUID,
-                    "git-tree-sha1" => tree,
+                    "git-tree-sha1" => final_tree,
                     "path" => "General.tar.gz",
                 )
             )
@@ -303,7 +416,7 @@ function prune(depot::AbstractString, keep::Integer, protect::AbstractString)
 end
 
 """
-    RegistrySnapshots.registry(cutoff; depot = first(DEPOT_PATH), keep = 1) -> RegistryInstance
+    RegistrySnapshots.registry(cutoff; depot = first(DEPOT_PATH), keep = 1, check_yanked = true) -> RegistryInstance
 
 The General registry as of `cutoff`, which may be a `Date`, a relative age such as
 `"7 days"`, or a date string.
@@ -312,17 +425,25 @@ The snapshot is fetched once per commit into `<depot>/registry_snapshots` and re
 compressed from then on, so repeated use costs nothing. Only the `keep` most recent are
 retained.
 
+Unless `check_yanked` is `false`, versions yanked on the live registry after `commit` are
+marked yanked in the snapshot too. This check only runs the first time a commit is fetched --
+a version yanked after that point will still be missed until the cached snapshot is deleted
+(`gc`) and re-fetched, since the snapshot is otherwise never touched again once cached.
+
 Pass the result as the `registries` keyword argument of any Pkg operation, or use the
 wrappers in this module, which do that for you.
 """
-function registry(cutoff; depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1)
+function registry(
+        cutoff; depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1,
+        check_yanked::Bool = true
+    )
     date, commit, tree = resolve_date(parse_cutoff(cutoff))
     dir = snapshot_dir(depot, commit)
     toml = snapshot_toml(depot, commit)
     if !isfile(toml)
         @info "Fetching General registry as of $date ($(commit[1:8]))"
         create_cachedir_tag(snapshots_dir(depot))
-        materialize(commit, tree, index()["tarball_url"]::String, dir)
+        materialize(commit, tree, index()["tarball_url"]::String, dir; check_yanked)
         prune(depot, keep, dir)
     end
     # Pkg caches registry instances by path and tree hash, so this is cheap to call often.
@@ -359,8 +480,11 @@ for f in WRAPPED
 
         As `Pkg.$($(string(f)))`, but resolving against the General registry as of `cutoff`.
         """
-        function $f(args...; cutoff, depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1, kwargs...)
-            return Pkg.$f(args...; registries = [registry(cutoff; depot, keep)], kwargs...)
+        function $f(
+                args...; cutoff, depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1,
+                check_yanked::Bool = true, kwargs...
+            )
+            return Pkg.$f(args...; registries = [registry(cutoff; depot, keep, check_yanked)], kwargs...)
         end
     end
 end
