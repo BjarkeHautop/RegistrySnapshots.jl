@@ -103,4 +103,4 @@ julia tools/generate_index.jl [--index PATH] [--repo PATH] [--first YYYY-MM-DD]
 
 Reads the existing index, works out which days are missing, and fetches only enough history to cover them. Existing entries are never recomputed, and a run with nothing to add makes no network requests at all.
 
-[`.github/workflows/update-index.yml`](.github/workflows/update-index.yml) runs this daily at 12:00 UTC and commits the result if anything changed.
+[`.github/workflows/update-index.yml`](https://github.com/BjarkeHautop/RegistrySnapshots.jl/blob/main/.github/workflows/update-index.yml) (defined on `main`, since scheduled workflows always run from the default branch) runs this daily at 12:00 UTC and commits the result to the [`index-data`](https://github.com/BjarkeHautop/RegistrySnapshots.jl/tree/index-data) branch if anything changed -- kept separate so the daily bot commits don't clutter either branch's history. The copy of `index.toml` checked in here is just a point-in-time snapshot, not kept current by that workflow.
