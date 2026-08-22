@@ -1,8 +1,11 @@
 # RegistrySnapshots.jl
 
+> [!NOTE]
+> This branch requires a patched Pkg.jl and Julia nightly, in exchange for never touching your depot's live registry (see [What it does to your depot](#what-it-does-to-your-depot)). For a version that works with stock Julia and stock Pkg, by overwriting the depot's registry instead of passing a snapshot in per-call, see the [`main`](https://github.com/BjarkeHautop/RegistrySnapshots.jl/tree/main) branch.
+
 Resolve Julia packages against the General registry as it existed on an earlier day. Requires a patched [Pkg.jl version](https://github.com/BjarkeHautop/Pkg.jl/tree/explicit-registries) and Julia nightly to function. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
 
-Why the patch: stock Pkg always resolves against whatever registry is installed in your depot, there's no per-call override. Without the patch, resolving against a snapshot would mean overwriting your live registry and restoring it after — affecting every other project using that depot in the meantime, and leaving it broken if the process dies mid-swap. The patch just adds a `registries` keyword so a snapshot can be passed in for one call, depot untouched.
+Why the patch: stock Pkg always resolves against whatever registry is installed in your depot, there's no per-call override. Without the patch, resolving against a snapshot would mean overwriting your live registry. The patch just adds a `registries` keyword so a snapshot can be passed in for one call, depot untouched.
 
 To use it simply just use RegistrySnapshots whenever you would use Pkg:
 
@@ -13,30 +16,27 @@ RegistrySnapshots.add("Example"; cutoff = "7 days")   # or cutoff = Date(2026, 1
 
 Every Pkg operation that consults a registry has a wrapper here that takes the same arguments plus `cutoff`. They resolve against the snapshot for that day instead of whatever is installed in your depot.
 
-Snapshots are stored beside it, in `<depot>/registry_snapshots/`, and handed to Pkg per operation through its `registries` keyword argument.
-
-A full example is shown in `/examples/end_to_end.jl`, which clones the patched Pkg.jl, and install Examples from 30 days ago. To run
-it clone this repo and run
+A full example is shown in `/examples/end_to_end.jl` (which clones the patched Pkg.jl fork and installs Example from 30 days ago). To run it, clone this repo and run
 ```bash
 julia +nightly examples/end_to_end.jl
 ```
 
 ## How it works
 
-Julia registries carry no publication timestamps. `Versions.toml` records only a tree hash and a yanked flag, so a cutoff cannot be applied by filtering versions the way other tools do. Instead the registry is rolled back via a published index maps each day to the General commit that was current at the end of it, and that commit's tree is fetched and resolved against directly, without ever touching your installed registry:
+Julia registries carry no publication timestamps. `Versions.toml` records only a tree hash and a yanked flag, so a cutoff cannot be applied by filtering versions the way other tools do. Instead the registry is rolled back via a published index that maps each day to the General commit that was current at the end of it, and that commit's tree is fetched and resolved against directly, without ever touching your installed registry:
 
 ```
 add("DataFrames"; cutoff = "7 days")
    -> today - 7 = 2026-08-14
    -> index lookup: 2026-08-14 = commit 862be195, tree 128729c9
    -> fetch codeload.github.com/JuliaRegistries/General/tar.gz/862be195
-   -> store as a compressed registry under <depot>/registry_snapshots/862be195/
-   -> Pkg.add("Example"; registries = [that snapshot])
+   -> cache as a compressed registry under <depot>/registry_snapshots/862be195/
+   -> Pkg.add("DataFrames"; registries = [that snapshot])
 ```
 
 ### What it does to your depot
 
-Nothing to your live registry. The snapshot is kept in its own directory, `<depot>/registry_snapshots/<commit>/`, in the same compressed format Pkg uses for `<depot>/registries`, and is only ever passed to Pkg explicitly via the `registries` keyword for that one call.
+The live registry is never touched. The snapshot is kept in its own directory, `<depot>/registry_snapshots/<commit>/`, in the same compressed format Pkg uses for `<depot>/registries`, and passed to Pkg explicitly via the `registries` keyword for just that call.
 
 ### Cost
 
@@ -50,11 +50,11 @@ Nothing to your live registry. The snapshot is kept in its own directory, `<depo
 
 Only the `keep` most recent snapshots are retained per depot (default 1), so a rolling `cutoff = "7 days"` does not accumulate one per day.
 
+Each new snapshot is a full tarball download, not an incremental one, since there's no git-style fetch of just the objects that changed since the last cached commit.
+
 ### Yanks
 
-A frozen snapshot has an obvious problem: if a version gets yanked *after* the cutoff day, the snapshot has no way to know, and would happily keep resolving to it forever. To fix that, the first time a commit is fetched, `registries`/the wrappers also download the live registry to a temp file, scan it for `yanked = true` entries, and overlay those onto the snapshot — after the snapshot's own tree hash has already been checked against the index. Pass `check_yanked = false` to skip this and save the extra download.
-
-This check only runs once, when a commit is first materialized. A version yanked *after* that point is still missed until the cached snapshot is deleted (`gc`) and re-fetched — snapshots are otherwise never touched again once cached.
+A frozen snapshot has an obvious problem: if a version gets yanked *after* the cutoff day, the snapshot has no way to know, and would happily keep resolving to it forever. To fix that, the first time a commit is fetched, `registry`/the wrappers also download the live registry to a temp file, scan it for `yanked = true` entries, and overlay those onto the snapshot. Pass `check_yanked = false` to skip this and save the extra download.
 
 ## API
 
@@ -66,13 +66,13 @@ This check only runs once, when a commit is first materialized. A version yanked
 | `RegistrySnapshots.gc(; depot, keep = 0)` | delete cached snapshots, keeping the `keep` most recently used |
 | `RegistrySnapshots.coverage()` | the range of days the index can resolve to |
 
-Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`), `keep` (default `1`, how many snapshots to retain in that depot), and `check_yanked` (default `true`, see [Yanks](#yanks)). Everything else is forwarded straight to the underlying `Pkg` function.
+Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`), `keep` (default `1`, how many snapshots to retain in that depot's cache), and `check_yanked` (default `true`, see [Yanks](#yanks)). Everything else is forwarded straight to the underlying `Pkg` function.
 
 `cutoff` accepts a `Date`, a relative age (`"7 days"`, `"2 weeks"`), or a date string (`"2026-01-01"`).
 
 ### Environment
 
-To keep cached snapshots isolated from your normal setup, pass `depot = ...` explicitly, or start Julia with `JULIA_DEPOT_PATH` pointing at a separate depot.
+Unlike main branch it never overwrites your other depot. `depot` only affects where snapshots are cached. If you'd still like that cache kept apart from your everyday depot, pass `depot = ...` explicitly, or start Julia with `JULIA_DEPOT_PATH` pointing at a separate depot.
 
 `JULIA_REGISTRY_SNAPSHOT_INDEX` overrides the index location, and accepts a local path as well as a URL.
 
