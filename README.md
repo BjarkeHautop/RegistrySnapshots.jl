@@ -1,5 +1,8 @@
 # RegistrySnapshots.jl
 
+> [!NOTE]
+> This branch overwrites the depot's live registry to resolve against a snapshot (see [What it does to your depot](#what-it-does-to-your-depot)). A version that never touches the depot requires a patched Pkg.jl and Julia nightly. See the [`explicit-registries`](https://github.com/BjarkeHautop/RegistrySnapshots.jl/tree/explicit-registries) branch.
+
 Resolve Julia packages against the General registry as it existed on an earlier day. Works with stock Julia and stock Pkg. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
 
 To use it simply just use RegistrySnapshots whenever you would use Pkg:
