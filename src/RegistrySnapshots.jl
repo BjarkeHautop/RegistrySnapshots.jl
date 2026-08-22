@@ -25,7 +25,7 @@ using Tar
 import Downloads
 using CodecZlib: GzipDecompressorStream, GzipCompressorStream
 
-const DEFAULT_INDEX_URL = "https://raw.githubusercontent.com/BjarkeHautop/RegistrySnapshots.jl/master/index.toml"
+const DEFAULT_INDEX_URL = "https://raw.githubusercontent.com/BjarkeHautop/RegistrySnapshots.jl/index-data/index.toml"
 
 const REGISTRY_UUID = "23338594-aafe-5451-b93e-139f81909106"
 

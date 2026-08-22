@@ -17,7 +17,11 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
+      # Commits land on `index-data`, not this workflow's own branch, so the daily bot
+      # commits don't clutter history here -- `DEFAULT_INDEX_URL` points at that branch.
       - uses: actions/checkout@v4
+        with:
+          ref: index-data
 
       - uses: julia-actions/setup-julia@v2
         with:
