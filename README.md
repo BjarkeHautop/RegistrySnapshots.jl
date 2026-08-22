@@ -1,8 +1,6 @@
 # RegistrySnapshots.jl
 
-Resolve Julia packages against the General registry as it existed on an earlier day. Requires a patched [Pkg.jl version](https://github.com/BjarkeHautop/Pkg.jl/tree/explicit-registries) and Julia nightly to function. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
-
-Why the patch: stock Pkg always resolves against whatever registry is installed in your depot, there's no per-call override. Without the patch, resolving against a snapshot would mean overwriting your live registry and restoring it after — affecting every other project using that depot in the meantime, and leaving it broken if the process dies mid-swap. The patch just adds a `registries` keyword so a snapshot can be passed in for one call, depot untouched.
+Resolve Julia packages against the General registry as it existed on an earlier day. Works with stock Julia and stock Pkg. Made with the usage of AI, and relies on internals of Tar.jl, so use at your own risk.
 
 To use it simply just use RegistrySnapshots whenever you would use Pkg:
 
@@ -11,32 +9,30 @@ using RegistrySnapshots
 RegistrySnapshots.add("Example"; cutoff = "7 days")   # or cutoff = Date(2026, 1, 1)
 ```
 
-Every Pkg operation that consults a registry has a wrapper here that takes the same arguments plus `cutoff`. They resolve against the snapshot for that day instead of whatever is installed in your depot.
+Every Pkg operation that consults a registry has a wrapper here that takes the same arguments plus `cutoff`. Each one checks out the General registry as of that day into the depot, then calls the matching plain `Pkg` function.
 
-Snapshots are stored beside it, in `<depot>/registry_snapshots/`, and handed to Pkg per operation through its `registries` keyword argument.
-
-A full example is shown in `/examples/end_to_end.jl`, which clones the patched Pkg.jl, and install Examples from 30 days ago. To run
-it clone this repo and run
+A full example is shown in `/examples/end_to_end.jl` (which does it in a scratch dir to avoid overwriting your depot). To run it, clone this repo and run
 ```bash
-julia +nightly examples/end_to_end.jl
+julia examples/end_to_end.jl
 ```
 
 ## How it works
 
-Julia registries carry no publication timestamps. `Versions.toml` records only a tree hash and a yanked flag, so a cutoff cannot be applied by filtering versions the way other tools do. Instead the registry is rolled back via a published index maps each day to the General commit that was current at the end of it, and that commit's tree is fetched and resolved against directly, without ever touching your installed registry:
+Julia registries carry no publication timestamps. `Versions.toml` records only a tree hash and a yanked flag, so a cutoff cannot be applied by filtering versions the way other tools do. Instead the registry is rolled back via a published index that maps each day to the General commit that was current at the end of it, and that commit's tree is fetched and installed as the depot's live registry:
 
 ```
 add("DataFrames"; cutoff = "7 days")
    -> today - 7 = 2026-08-14
    -> index lookup: 2026-08-14 = commit 862be195, tree 128729c9
    -> fetch codeload.github.com/JuliaRegistries/General/tar.gz/862be195
-   -> store as a compressed registry under <depot>/registry_snapshots/862be195/
-   -> Pkg.add("Example"; registries = [that snapshot])
+   -> cache as a compressed registry under <depot>/registry_snapshots/862be195/
+   -> overwrite <depot>/registries/General.{toml,tar.gz} with it
+   -> Pkg.add("DataFrames")
 ```
 
 ### What it does to your depot
 
-Nothing to your live registry. The snapshot is kept in its own directory, `<depot>/registry_snapshots/<commit>/`, in the same compressed format Pkg uses for `<depot>/registries`, and is only ever passed to Pkg explicitly via the `registries` keyword for that one call.
+`RegistrySnapshots.checkout!` overwrites `<depot>/registries/General.toml` and `General.tar.gz` in place. This is the same thing `Pkg.Registry.update()` does for a live update, just pointed at a historical commit instead.
 
 ### Cost
 
@@ -50,29 +46,33 @@ Nothing to your live registry. The snapshot is kept in its own directory, `<depo
 
 Only the `keep` most recent snapshots are retained per depot (default 1), so a rolling `cutoff = "7 days"` does not accumulate one per day.
 
+Each new snapshot is a full tarball download, not an incremental one, since there's no git-style fetch of just the objects that changed since the last cached commit.
+
 ### Yanks
 
-A frozen snapshot has an obvious problem: if a version gets yanked *after* the cutoff day, the snapshot has no way to know, and would happily keep resolving to it forever. To fix that, the first time a commit is fetched, `registries`/the wrappers also download the live registry to a temp file, scan it for `yanked = true` entries, and overlay those onto the snapshot — after the snapshot's own tree hash has already been checked against the index. Pass `check_yanked = false` to skip this and save the extra download.
-
-This check only runs once, when a commit is first materialized. A version yanked *after* that point is still missed until the cached snapshot is deleted (`gc`) and re-fetched — snapshots are otherwise never touched again once cached.
+A frozen snapshot has an obvious problem: if a version gets yanked *after* the cutoff day, the snapshot has no way to know, and would happily keep resolving to it forever. To fix that, the first time a commit is fetched, `checkout!`/the wrappers also download the live registry to a temp file, scan it for `yanked = true` entries, and overlay those onto the snapshot. Pass `check_yanked = false` to skip this and save the extra download.
 
 ## API
 
 | function | what it does |
 |---|---|
-| `add`, `develop`, `rm`, `update`, `pin`, `free`, `instantiate`, `resolve`, `status`, `why` | as the matching `Pkg.*` function, but resolved against the General registry as of `cutoff` |
-| `RegistrySnapshots.registry(cutoff; depot, keep, check_yanked)` | the snapshot for `cutoff` as a `Pkg.Registry.RegistryInstance` — pass it yourself as `registries = [...]` to any other Pkg call |
-| `RegistrySnapshots.cached(; depot)` | commits currently cached in `depot` |
+| `add`, `develop`, `rm`, `update`, `pin`, `free`, `instantiate`, `resolve`, `status`, `why` | as the matching `Pkg.*` function, but first checks out the General registry as of `cutoff` into the depot |
+| `RegistrySnapshots.checkout!(cutoff; depot, keep, check_yanked)` | checks out the General registry as of `cutoff` into `depot`'s live registries, returning the day actually checked out — the primitive the wrappers above are built on |
+| `RegistrySnapshots.restore!(; depot)` | undo `checkout!`: re-fetch the live General registry into `depot`, same as `Pkg.Registry.update()` |
+| `RegistrySnapshots.cached(; depot)` | snapshot commits currently cached in `depot` (not the same as what's currently checked out) |
 | `RegistrySnapshots.gc(; depot, keep = 0)` | delete cached snapshots, keeping the `keep` most recently used |
 | `RegistrySnapshots.coverage()` | the range of days the index can resolve to |
 
-Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`), `keep` (default `1`, how many snapshots to retain in that depot), and `check_yanked` (default `true`, see [Yanks](#yanks)). Everything else is forwarded straight to the underlying `Pkg` function.
+Every wrapper takes `cutoff` as a required keyword, plus optional `depot` (default `first(DEPOT_PATH)`), `keep` (default `1`, how many snapshots to retain in that depot's cache), and `check_yanked` (default `true`, see [Yanks](#yanks)). Everything else is forwarded straight to the underlying `Pkg` function.
 
 `cutoff` accepts a `Date`, a relative age (`"7 days"`, `"2 weeks"`), or a date string (`"2026-01-01"`).
 
+Since `checkout!` writes directly into `<depot>/registries`, `depot` only has an effect if it's part of `DEPOT_PATH` — the wrappers and `restore!` handle this for you, temporarily adding it if it isn't already there.
+
 ### Environment
 
-To keep cached snapshots isolated from your normal setup, pass `depot = ...` explicitly, or start Julia with `JULIA_DEPOT_PATH` pointing at a separate depot.
+If you don't want it `checkout!` to mutate your depot's live registry
+you can instead use a dedicated depot for this rather than your everyday one. To do so, pass `depot = ...` explicitly, or start Julia with `JULIA_DEPOT_PATH` pointing at a separate depot (note that you lose your precompiled cache from your main depot doing this).
 
 `JULIA_REGISTRY_SNAPSHOT_INDEX` overrides the index location, and accepts a local path as well as a URL.
 

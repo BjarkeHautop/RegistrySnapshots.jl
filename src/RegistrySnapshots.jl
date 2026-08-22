@@ -6,16 +6,15 @@ Resolve packages against the General registry as it existed on an earlier day.
 Julia registries carry no publication timestamps (`Versions.toml` records only a tree hash
 and a yanked flag), so a cutoff cannot be applied by filtering versions. Instead the whole
 registry is rolled back: a published index maps each day to the registry commit current at
-the end of it, and that commit's registry is what gets resolved against.
+the end of it, and that commit's registry is installed as the depot's live General registry.
 
 ```julia
 using RegistrySnapshots
 RegistrySnapshots.add("DataFrames"; cutoff = "7 days")   # or cutoff = Date(2026, 1, 1)
 ```
 
-Nothing is installed into the depot's registry directory and the live General registry is
-never touched. Snapshots are stored beside it in the same compressed format Pkg uses, and
-handed to Pkg per operation through its `registries` keyword argument.
+This works with stock Julia and stock Pkg: `checkout!` overwrites `<depot>/registries/General.{toml,tar.gz}`
+in place. See [`restore!`](@ref) to go back to the live registry.
 """
 module RegistrySnapshots
 
@@ -137,11 +136,9 @@ function resolve_date(cutoff::Date)
 end
 
 """
-Where snapshots are kept: beside the depot's `registries` directory, never inside it.
-
-Pkg discovers every directory and every registry TOML under `<depot>/registries`, so a
-snapshot stored there would be picked up by ordinary operations as a second registry
-carrying General's UUID. Kept here, a snapshot is invisible until it is passed explicitly.
+A private cache of previously fetched commits, kept beside the depot's `registries`
+directory rather than inside it so ordinary Pkg operations never see it. `checkout!` installs
+one of these into `registries` explicitly; nothing here is picked up on its own.
 """
 snapshots_dir(depot::AbstractString) = joinpath(depot, "registry_snapshots")
 
@@ -241,7 +238,7 @@ end
 # Scans the live registry tarball for every `Versions.toml` that currently has at least one
 # `yanked = true` entry. Costs one full registry
 # download (same size as a snapshot fetch), so it is only worth paying once per newly
-# materialized snapshot, never per resolve.
+# materialized snapshot.
 function fetch_yanked_versions(tarball_url::AbstractString, ref::AbstractString)
     yanked = Dict{String, Set{String}}()
     raw = tempname()
@@ -415,25 +412,57 @@ function prune(depot::AbstractString, keep::Integer, protect::AbstractString)
     return removed
 end
 
+registries_dir(depot::AbstractString) = joinpath(depot, "registries")
+
+# Installs `src` (a materialized `<commit>/{General.toml,General.tar.gz}` pair) as the
+# depot's live General registry. Each file is staged under a temp name in the same directory
+# and then `mv`'d into place -- same-filesystem `mv` renames rather than copying, so the
+# replace is a single atomic syscall per file: a process killed mid-swap leaves either the
+# old pair or the new one on disk, never a half-written file.
+function checkout_registry!(depot::AbstractString, src::AbstractString)
+    dir = registries_dir(depot)
+    mkpath(dir)
+
+    # The pre-1.7 Pkg layout keeps an extracted `<depot>/registries/General/` directory
+    # instead of a compressed pair. Left in place it would be discovered as a second copy of
+    # the same UUID, so it's moved aside (once) rather than overwritten.
+    extracted = joinpath(dir, "General")
+    if isdir(extracted)
+        backup = extracted * ".bak"
+        Base.rm(backup; recursive = true, force = true)
+        mv(extracted, backup)
+        @warn "Found an extracted `General` registry; moved it aside" from = extracted to = backup
+    end
+
+    for name in ("General.toml", "General.tar.gz")
+        dst = joinpath(dir, name)
+        tmp = dst * ".tmp"
+        cp(joinpath(src, name), tmp; force = true)
+        mv(tmp, dst; force = true)
+    end
+    # Newer Pkg defaults to zstd (`General.tar.zst`); harmless once `General.toml` points at
+    # our `.tar.gz` instead, but stale otherwise, so it's cleaned up rather than left orphaned.
+    Base.rm(joinpath(dir, "General.tar.zst"); force = true)
+    return nothing
+end
+
 """
-    RegistrySnapshots.registry(cutoff; depot = first(DEPOT_PATH), keep = 1, check_yanked = true) -> RegistryInstance
+    RegistrySnapshots.checkout!(cutoff; depot = first(DEPOT_PATH), keep = 1, check_yanked = true) -> Date
 
-The General registry as of `cutoff`, which may be a `Date`, a relative age such as
-`"7 days"`, or a date string.
+Overwrite `depot`'s live General registry with the snapshot as of `cutoff` (a `Date`, a
+relative age such as `"7 days"`, or a date string), and return the day actually checked out.
 
-The snapshot is fetched once per commit into `<depot>/registry_snapshots` and read
-compressed from then on, so repeated use costs nothing. Only the `keep` most recent are
-retained.
+This replaces `<depot>/registries/General.toml` and `.tar.gz` in place. See
+[`restore!`](@ref) to go back to the live registry.
 
-Unless `check_yanked` is `false`, versions yanked on the live registry after `commit` are
-marked yanked in the snapshot too. This check only runs the first time a commit is fetched --
-a version yanked after that point will still be missed until the cached snapshot is deleted
-(`gc`) and re-fetched, since the snapshot is otherwise never touched again once cached.
+The snapshot itself is fetched once per commit into `<depot>/registry_snapshots` and reused
+compressed from then on, so repeated calls with the same cutoff cost nothing beyond the
+file copy above. Only the `keep` most recently used cached commits are retained.
 
-Pass the result as the `registries` keyword argument of any Pkg operation, or use the
-wrappers in this module, which do that for you.
+Unless `check_yanked` is `false`, versions yanked on the live registry after the snapshot's
+commit are marked yanked in it too. This check only runs the first time a commit is fetched.
 """
-function registry(
+function checkout!(
         cutoff; depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1,
         check_yanked::Bool = true
     )
@@ -446,14 +475,33 @@ function registry(
         materialize(commit, tree, index()["tarball_url"]::String, dir; check_yanked)
         prune(depot, keep, dir)
     end
-    # Pkg caches registry instances by path and tree hash, so this is cheap to call often.
-    return Pkg.Registry.RegistryInstance(toml)
+    checkout_registry!(depot, dir)
+    return date
+end
+
+"""
+    RegistrySnapshots.restore!(; depot = first(DEPOT_PATH))
+
+Undo [`checkout!`](@ref): re-fetch the live General registry into `depot`, the same as
+running `Pkg.Registry.update()` yourself. `depot` is temporarily added to `DEPOT_PATH` for
+the call if it isn't already part of it.
+"""
+function restore!(; depot::AbstractString = first(DEPOT_PATH))
+    inserted = !(depot in DEPOT_PATH)
+    inserted && pushfirst!(DEPOT_PATH, depot)
+    try
+        Pkg.Registry.update()
+    finally
+        inserted && popfirst!(DEPOT_PATH)
+    end
+    return nothing
 end
 
 """
     RegistrySnapshots.cached(; depot = first(DEPOT_PATH)) -> Vector{String}
 
-The snapshot commits currently stored in `depot`.
+The snapshot commits currently cached in `depot` (see [`checkout!`](@ref)); not the same as
+which one, if any, is currently checked out into `depot`'s live registry.
 """
 function cached(; depot::AbstractString = first(DEPOT_PATH))
     dir = snapshots_dir(depot)
@@ -464,13 +512,15 @@ end
 """
     RegistrySnapshots.gc(; depot = first(DEPOT_PATH), keep = 0)
 
-Delete cached snapshots, keeping the `keep` most recently used.
+Delete cached snapshots, keeping the `keep` most recently used. Does not touch whichever
+registry is currently checked out into `depot`'s live registries directory.
 """
 gc(; depot::AbstractString = first(DEPOT_PATH), keep::Integer = 0) = prune(depot, keep, "")
 
 # The Pkg operations that consult a registry. Each takes the same arguments as its `Pkg`
-# counterpart plus a `cutoff`, and resolves against the snapshot for that day instead of
-# against whatever is installed in the depot.
+# counterpart plus a `cutoff`, checks out that day's registry into `depot`, and then calls
+# plain `Pkg.$f` -- no patched Pkg or special keyword needed, since by then `depot`'s registry
+# genuinely is the snapshot.
 const WRAPPED = (:add, :develop, :rm, :update, :pin, :free, :instantiate, :resolve, :status, :why)
 
 for f in WRAPPED
@@ -478,13 +528,21 @@ for f in WRAPPED
         """
             RegistrySnapshots.$($(string(f)))(args...; cutoff, kwargs...)
 
-        As `Pkg.$($(string(f)))`, but resolving against the General registry as of `cutoff`.
+        As `Pkg.$($(string(f)))`, but first checking out the General registry as of `cutoff`
+        into the depot (see [`checkout!`](@ref)).
         """
         function $f(
                 args...; cutoff, depot::AbstractString = first(DEPOT_PATH), keep::Integer = 1,
                 check_yanked::Bool = true, kwargs...
             )
-            return Pkg.$f(args...; registries = [registry(cutoff; depot, keep, check_yanked)], kwargs...)
+            checkout!(cutoff; depot, keep, check_yanked)
+            inserted = !(depot in DEPOT_PATH)
+            inserted && pushfirst!(DEPOT_PATH, depot)
+            try
+                return Pkg.$f(args...; kwargs...)
+            finally
+                inserted && popfirst!(DEPOT_PATH)
+            end
         end
     end
 end
