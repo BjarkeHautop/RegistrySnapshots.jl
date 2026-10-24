@@ -308,3 +308,4 @@ tarball_url = "https://codeload.github.com/JuliaRegistries/General/tar.gz"
 "2026-10-20" = { commit = "32d708ce88fb7f7d026c8f22ea189d00d9b2ef29", tree = "ea9fe9bb42385a0455baf3807b5c743a470cab43" }
 "2026-10-21" = { commit = "3b20469808d030045bd0d5a9e23a9773a89bca4c", tree = "bcd3b200beea0abb91994838a816ec36c0d39b26" }
 "2026-10-22" = { commit = "70bbdaa85227c8deaa8cf3f690196d5987bb8380", tree = "38e3276aed9575c432e7e8665c36a7d986eb54a4" }
+"2026-10-23" = { commit = "962ffee7c917b651727b20bfedba200674c44177", tree = "0f11451a037e127d2278d3fcde4c6ff568ba73a3" }
